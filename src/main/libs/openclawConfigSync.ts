@@ -87,12 +87,10 @@ export class OpenClawConfigSync {
     const apiResolution = resolveRawApiConfig();
 
     if (!apiResolution.config) {
-      return {
-        ok: false,
-        changed: false,
-        configPath,
-        error: apiResolution.error || 'OpenClaw config sync failed: model config is unavailable.',
-      };
+      // No API/model configured yet (fresh install).
+      // Write a minimal config so the gateway can start — it just won't have
+      // any model provider until the user configures one.
+      return this.writeMinimalConfig(configPath, reason);
     }
 
     const { baseURL, apiKey, model, apiType } = apiResolution.config;
@@ -389,6 +387,76 @@ export class OpenClawConfigSync {
         changed: true,
         configPath,
       };
+    } catch (error) {
+      return {
+        ok: false,
+        changed: false,
+        configPath,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Write a minimal openclaw.json that lets the gateway start without any
+   * model/provider configured.  The full config will be synced once the
+   * user sets up a model in the UI.
+   */
+  private writeMinimalConfig(configPath: string, _reason: string): OpenClawConfigSyncResult {
+    const preinstalledPluginIds = readPreinstalledPluginIds();
+
+    const minimalConfig: Record<string, unknown> = {
+      gateway: {
+        mode: 'local',
+      },
+      ...(preinstalledPluginIds.length > 0
+        ? {
+            plugins: {
+              entries: {
+                ...Object.fromEntries(
+                  preinstalledPluginIds.map((id) => [id, { enabled: true }]),
+                ),
+                ...(preinstalledPluginIds.includes('feishu-openclaw-plugin')
+                  ? { feishu: { enabled: false } }
+                  : {}),
+              },
+            },
+          }
+        : {}),
+    };
+
+    const nextContent = `${JSON.stringify(minimalConfig, null, 2)}\n`;
+    let currentContent = '';
+    try {
+      currentContent = fs.readFileSync(configPath, 'utf8');
+    } catch {
+      currentContent = '';
+    }
+
+    // If the file already has a full config (from a previous sync), don't
+    // downgrade it to the minimal version.
+    if (currentContent && currentContent !== nextContent) {
+      try {
+        const existing = JSON.parse(currentContent);
+        if (existing.models?.providers) {
+          // Already has a full config — keep it.
+          return { ok: true, changed: false, configPath };
+        }
+      } catch {
+        // Malformed JSON — overwrite with minimal config.
+      }
+    }
+
+    if (currentContent === nextContent) {
+      return { ok: true, changed: false, configPath };
+    }
+
+    try {
+      ensureDir(path.dirname(configPath));
+      const tmpPath = `${configPath}.tmp-${Date.now()}`;
+      fs.writeFileSync(tmpPath, nextContent, 'utf8');
+      fs.renameSync(tmpPath, configPath);
+      return { ok: true, changed: true, configPath };
     } catch (error) {
       return {
         ok: false,
